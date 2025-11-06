@@ -8,9 +8,9 @@ dotenv.config();
 // Configuration
 const CONFIG = {
   BATCH_SIZE_SMALL: 10,
-  BATCH_SIZE_LARGE: 50,
-  WAIT_TIME_SHORT: 1 * 60 * 1000, // 1 minutes in milliseconds
-  WAIT_TIME_LONG: 10 * 60 * 1000, // 10 minutes in milliseconds
+  BATCH_SIZE_LARGE: 100,
+  WAIT_TIME_SHORT: 0.5 * 60 * 1000, // 1 minutes in milliseconds
+  WAIT_TIME_LONG: 5 * 60 * 1000, // 5 minutes in milliseconds
   INSTAGRAM_USERNAME: process.env.INSTAGRAM_USERNAME,
   INSTAGRAM_PASSWORD: process.env.INSTAGRAM_PASSWORD,
   CSV_FILE_PATH: process.env.CSV_FILE_PATH || "./users_to_unfollow.csv",
@@ -23,6 +23,61 @@ const CONFIG = {
 
 // Utility function to sleep
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Append a username to the removed users CSV (creates file with header if needed)
+function appendToRemovedCSV(username) {
+  const removedPath = "./removed_users.csv";
+  let existing = "";
+  if (fs.existsSync(removedPath)) {
+    existing = fs.readFileSync(removedPath, "utf8");
+  }
+
+  // Normalize username (no @ and trimmed)
+  const clean = username.trim().replace(/^@/, "");
+
+  // If already present, skip
+  const already = existing
+    .split(/\r?\n/)
+    .map((l) => l.replace(/"/g, "").split(",")[0]?.trim())
+    .filter(Boolean)
+    .some((u) => u.toLowerCase() === clean.toLowerCase());
+
+  if (already) return;
+
+  if (!existing) {
+    // create with header
+    fs.writeFileSync(removedPath, `username\n${clean}\n`, "utf8");
+  } else {
+    fs.appendFileSync(removedPath, `${clean}\n`, "utf8");
+  }
+}
+
+// Remove a username from the original CSV file. This rewrites the CSV as a
+// single-column file with header 'username' followed by remaining values.
+// NOTE: This simplifies multi-column CSVs into a single-column file. If your
+// CSV contains more data per row you may want a more-preserving implementation.
+function removeUsernameFromCSV(filePath, username) {
+  if (!fs.existsSync(filePath)) return;
+
+  const content = fs.readFileSync(filePath, "utf8");
+  const lines = content.split(/\r?\n/).filter((l) => l.trim() !== "");
+
+  // Determine if first line is a header
+  let dataLines = lines;
+  if (lines.length > 0 && /username/i.test(lines[0])) {
+    dataLines = lines.slice(1);
+  }
+
+  const clean = username.trim().replace(/^@/, "");
+
+  const remaining = dataLines
+    .map((line) => line.replace(/"/g, "").split(",")[0]?.trim())
+    .filter(Boolean)
+    .filter((u) => u.toLowerCase() !== clean.toLowerCase());
+
+  const out = ["username", ...remaining].join("\n") + "\n";
+  fs.writeFileSync(filePath, out, "utf8");
+}
 
 // Read CSV file and extract usernames
 async function readUsernamesFromCSV(filePath) {
@@ -152,7 +207,7 @@ async function unfollowUser(page, username) {
       return { success: false, reason: "profile_not_found" };
     }
 
-    await sleep(1000);
+    await sleep(500);
 
     // Look for the "Following" button
     const followingButton = await page.evaluate(() => {
@@ -177,7 +232,7 @@ async function unfollowUser(page, username) {
 
     // Wait for the unfollow confirmation modal to appear
     console.log(`   Waiting for confirmation modal...`);
-    await sleep(3000);
+    await sleep(2000);
 
     // Try to click the unfollow option in the modal using multiple methods
     let unfollowConfirmed = false;
@@ -379,38 +434,64 @@ async function main() {
         totalUnfollowed++;
         processedInBatch++;
         results.success.push(username);
+        // On successful unfollow, record and remove from source CSV
+        try {
+          appendToRemovedCSV(username);
+          removeUsernameFromCSV(CONFIG.CSV_FILE_PATH, username);
+        } catch (e) {
+          console.log(`⚠️  Failed updating CSV for ${username}: ${e.message}`);
+        }
       } else {
         results.failed.push({ username, reason: result.reason });
         if (result.reason === "profile_not_found") {
           results.notFound.push(username);
         } else if (result.reason === "not_following") {
           results.notFollowing.push(username);
+          // If we already aren't following, treat as removed: add to removed CSV and remove from source CSV
+          try {
+            appendToRemovedCSV(username);
+            removeUsernameFromCSV(CONFIG.CSV_FILE_PATH, username);
+          } catch (e) {
+            console.log(
+              `⚠️  Failed updating CSV for ${username}: ${e.message}`
+            );
+          }
         }
       }
 
-      // Rate limiting logic
-      if (
-        processedInBatch === CONFIG.BATCH_SIZE_SMALL &&
-        totalUnfollowed % CONFIG.BATCH_SIZE_LARGE !== 0
-      ) {
-        console.log(
-          `\n⏳ Completed ${processedInBatch} unfollows. Waiting 1 minute...\n`
-        );
-        await sleep(CONFIG.WAIT_TIME_SHORT);
-        processedInBatch = 0;
-      } else if (
-        totalUnfollowed > 0 &&
-        totalUnfollowed % CONFIG.BATCH_SIZE_LARGE === 0
-      ) {
-        console.log(
-          `\n⏳ Completed ${CONFIG.BATCH_SIZE_LARGE} unfollows. Waiting 10 minutes...\n`
-        );
-        await sleep(CONFIG.WAIT_TIME_LONG);
-        processedInBatch = 0;
-      }
+      // Rate limiting and per-unfollow delay: only apply the longer waits and
+      // the 2-4s per-unfollow delay when an unfollow action actually
+      // occurred. If the profile was missing or you weren't following, skip
+      // the long waits and only do a very short pause so the script can
+      // continue quickly.
+      if (result.success) {
+        if (
+          processedInBatch === CONFIG.BATCH_SIZE_SMALL &&
+          totalUnfollowed % CONFIG.BATCH_SIZE_LARGE !== 0
+        ) {
+          console.log(
+            `\n⏳ Completed ${processedInBatch} unfollows. Waiting 1 minute...\n`
+          );
+          await sleep(CONFIG.WAIT_TIME_SHORT);
+          processedInBatch = 0;
+        } else if (
+          totalUnfollowed > 0 &&
+          totalUnfollowed % CONFIG.BATCH_SIZE_LARGE === 0
+        ) {
+          console.log(
+            `\n⏳ Completed ${CONFIG.BATCH_SIZE_LARGE} unfollows. Waiting 5 minutes...\n`
+          );
+          await sleep(CONFIG.WAIT_TIME_LONG);
+          processedInBatch = 0;
+        }
 
-      // Add small delay between each unfollow
-      await sleep(2000 + Math.random() * 2000); // 2-4 seconds random delay
+        // Add small delay between each successful unfollow (2-4s)
+        await sleep(1000 + Math.random() * 2000);
+      } else {
+        // No unfollow performed: skip long waits and heavy delay. A tiny
+        // throttle to avoid too-fast navigation (300-600ms).
+        await sleep(300 + Math.random() * 300);
+      }
     }
 
     // Summary
