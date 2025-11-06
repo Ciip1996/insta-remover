@@ -1,5 +1,11 @@
 node_modules/
 .env
-unfollow_results.json
 *.log
 .DS_Store
+
+# Input CSV with user data (keep example, ignore actual file)
+users_to_unfollow.csv
+
+# Output directory - all generated files (handled by output/.gitignore)
+output/*.csv
+output/*.json

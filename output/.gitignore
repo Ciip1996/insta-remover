@@ -1,0 +1,4 @@
+# Keep output directory in git but ignore its contents
+*
+!.gitignore
+!README.md
